@@ -33,8 +33,11 @@ Connected a new device while it's running? Press **Rescan devices**.
 
 1. Run `./run.sh --list`. If the mic isn't in that list, macOS isn't exposing it as an input:
    pick it once in System Settings > Sound > Input, then rescan.
-2. If it's listed but its card says "Could not open this mic", macOS likely can't run
-   that many Bluetooth mics at once. Disconnect one and rescan.
+2. If it's listed but its card shows an error, macOS didn't start it. Macs usually run only
+   **one Bluetooth headset mic at a time** (each needs its own "call mode" link, and macOS
+   doesn't run several). The app keeps working with the mics that did start. For more mics,
+   use wireless mic kits whose receiver plugs in over USB (they show up as normal USB mics),
+   or mix one Bluetooth mic with wired/USB ones.
 3. Cards show up but never light up: Terminal doesn't have microphone permission (see above).
 
 4. Mic lights up but you hear nothing: check the **Play through** picker at the top of the screen.
