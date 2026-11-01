@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mic Monitor</title>
+<style>
+  :root { --bg:#07090f; --panel:#111521; --panel-2:#171c2b; --text:#e9ecf5; --muted:#7d8599; --dim:#3a4154; --live:#3ef0a1; --listen:#6aa8ff; --warn:#ffcf5c; --err:#ff8a8a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    background: radial-gradient(1200px 600px at 50% -10%, #16203a 0%, var(--bg) 60%) fixed;
+    color: var(--text); font: 16px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center; padding: 40px 16px;
+  }
+  header { text-align: center; margin-bottom: 28px; }
+  h1 { margin: 0 0 6px; font-size: 34px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); font-size: 15px; }
+  .pills { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 14px; }
+  .pill { padding: 6px 12px; border-radius: 999px; font-size: 13px; border: 1px solid; }
+  .pill.warn { background: rgba(255,207,92,.08); color: var(--warn); border-color: rgba(255,207,92,.25); }
+  .pill.out { background: rgba(106,168,255,.08); color: var(--listen); border-color: rgba(106,168,255,.25); }
+  #grid { width: 100%; max-width: 1240px; display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(190px, 230px)); justify-content: center; }
+  .card {
+    position: relative; background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid #222a3d; border-radius: 22px; padding: 22px 18px 18px; cursor: pointer; user-select: none;
+    transition: transform .15s, border-color .2s, box-shadow .2s;
+    display: flex; flex-direction: column; align-items: center; gap: 14px; min-height: 250px;
+  }
+  .card:hover { transform: translateY(-2px); border-color: #34405c; }
+  .card.active { border-color: rgba(62,240,161,.45); box-shadow: 0 0 0 1px rgba(62,240,161,.15), 0 0 40px -8px rgba(62,240,161,.35); }
+  .card.listening { border-color: var(--listen); box-shadow: 0 0 0 2px var(--listen), 0 0 50px -6px rgba(106,168,255,.6); }
+  .card.broken { cursor: default; opacity: .7; }
+  .badge { position: absolute; top: 12px; right: 12px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; padding: 4px 8px; border-radius: 999px; background: var(--listen); color: #06101f; opacity: 0; transition: opacity .2s; }
+  .card.listening .badge { opacity: 1; }
+  .num { position: absolute; top: 14px; left: 16px; color: var(--dim); font-weight: 700; font-size: 13px; }
+  .bt { position: absolute; bottom: 12px; right: 14px; color: var(--dim); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; }
+  .icon { position: relative; width: 92px; height: 92px; border-radius: 50%; display: grid; place-items: center; background: #0c1019; border: 1px solid #222a3d; color: var(--dim); transition: color .15s, background .15s; }
+  .icon svg { width: 40px; height: 40px; }
+  .icon::before, .icon::after { content: ""; position: absolute; inset: -2px; border-radius: 50%; border: 2px solid var(--live); opacity: 0; }
+  .card.active .icon { color: var(--live); background: rgba(62,240,161,.08); }
+  .card.active .icon::before { animation: ring 1.2s ease-out infinite; }
+  .card.active .icon::after { animation: ring 1.2s ease-out .6s infinite; }
+  .card.listening .icon { color: var(--listen); }
+  .card.listening .icon::before, .card.listening .icon::after { border-color: var(--listen); }
+  @keyframes ring { 0% { transform: scale(1); opacity: .7; } 100% { transform: scale(1.6); opacity: 0; } }
+  .name { font-weight: 600; font-size: 17px; text-align: center; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .state { color: var(--muted); font-size: 13px; margin-top: -8px; text-align: center; }
+  .card.active .state { color: var(--live); }
+  .card.broken .state { color: var(--err); }
+  .meter { width: 100%; height: 10px; border-radius: 999px; background: #0c1019; overflow: hidden; border: 1px solid #1d2435; }
+  .meter > i { display: block; height: 100%; width: 0%; background: linear-gradient(90deg, #2bd18b, var(--live), #c8ff6a); border-radius: 999px; transition: width .06s linear; }
+  .card.listening .meter > i { background: linear-gradient(90deg, #4a8cff, var(--listen), #a9d0ff); }
+  .empty { max-width: 560px; margin: 0 auto; text-align: center; color: var(--muted); background: var(--panel); border: 1px dashed #2a3247; border-radius: 22px; padding: 40px 28px; }
+  .empty h2 { color: var(--text); margin: 0 0 8px; font-size: 22px; }
+  button { margin-top: 26px; background: transparent; color: var(--muted); border: 1px solid #2a3247; font: inherit; font-size: 14px; padding: 8px 16px; border-radius: 10px; cursor: pointer; }
+  button:hover { color: var(--text); border-color: #3a4560; }
+  footer { margin-top: 18px; color: var(--dim); font-size: 13px; text-align: center; }
+  .offline { color: var(--err); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Mic Monitor</h1>
+    <div class="sub">Every connected mic, live. Click one to listen to just that mic.</div>
+    <div class="pills">
+      <span class="pill warn">🎧 Wear headphones to avoid feedback</span>
+      <span class="pill out" id="out">Output: …</span>
+    </div>
+  </header>
+  <main id="grid"></main>
+  <button id="rescan">Rescan devices</button>
+  <footer id="foot">Audio stays on this laptop. Nothing is recorded or saved.</footer>
+<script>
+const MIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v4"/><path d="M8 21h8"/></svg>';
+const grid = document.getElementById('grid');
+let cards = new Map();   // id -> element
+let layoutKey = '';
+
+function clean(n) { return n.replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)\s*$/i, ''); }
+
+function build(mics) {
+  grid.innerHTML = ''; cards.clear();
+  if (!mics.length) {
+    grid.style.display = 'block';
+    grid.innerHTML = `<div class="empty"><h2>No Bluetooth mics found</h2>
+      <div>Connect a device, then press <b>Rescan devices</b>. If it still doesn't show,
+      pick it once in System Settings › Sound › Input, and make sure your Terminal app is allowed
+      under Privacy &amp; Security › Microphone.</div></div>`;
+    return;
+  }
+  grid.style.display = 'grid';
+  mics.forEach((m, i) => {
+    const el = document.createElement('div');
+    el.className = 'card';
+    el.innerHTML = `<span class="num">0${i + 1}</span><span class="badge">Listening</span>
+      <div class="icon">${MIC}</div><div class="name"></div><div class="state">Silent</div>
+      <div class="meter"><i></i></div><span class="bt">${m.bluetooth ? 'Bluetooth' : ''}</span>`;
+    el.querySelector('.name').textContent = clean(m.name);
+    el.querySelector('.name').title = m.name;
+    el.onclick = () => { if (!m.error) fetch('/listen/' + m.id, { method: 'POST' }); };
+    grid.appendChild(el);
+    cards.set(m.id, el);
+  });
+}
+
+function update(s) {
+  document.getElementById('out').textContent = 'Output: ' + s.output;
+  const key = s.mics.map(m => m.id + m.name + !!m.error).join('|');
+  if (key !== layoutKey) { layoutKey = key; build(s.mics); }
+  for (const m of s.mics) {
+    const el = cards.get(m.id); if (!el) continue;
+    el.classList.toggle('active', m.active);
+    el.classList.toggle('listening', m.listening);
+    el.classList.toggle('broken', !!m.error);
+    el.querySelector('.meter > i').style.width = Math.min(100, Math.sqrt(m.level) * 220) + '%';
+    el.querySelector('.state').textContent = m.error ? 'Could not open this mic'
+      : m.listening ? (m.active ? 'Listening · picking up sound' : 'Listening · quiet')
+      : (m.active ? 'Picking up sound' : 'Silent');
+  }
+}
+
+const foot = document.getElementById('foot');
+function connect() {
+  const es = new EventSource('/events');
+  es.onmessage = e => { foot.classList.remove('offline'); foot.textContent = 'Audio stays on this laptop. Nothing is recorded or saved.'; update(JSON.parse(e.data)); };
+  es.onerror = () => { foot.classList.add('offline'); foot.textContent = 'Lost connection to mic_monitor.py. Is it still running?'; };
+}
+document.getElementById('rescan').onclick = async e => {
+  e.target.textContent = 'Scanning…';
+  await fetch('/rescan', { method: 'POST' });
+  e.target.textContent = 'Rescan devices';
+};
+connect();
+</script>
+</body>
+</html>
