@@ -123,9 +123,13 @@ class Mic:
 
 
 class Monitor:
-    def __init__(self, bluetooth_only: bool, include_builtin: bool):
+    def __init__(self, bluetooth_only: bool, include_builtin: bool, output: str | None, gain: float):
         self.bluetooth_only = bluetooth_only
         self.include_builtin = include_builtin
+        self.output_pref = output   # name substring from --output, or None for laptop speakers
+        self.gain = gain
+        self.out_index: int | None = None
+        self.outputs: list[dict] = []
         self.lock = threading.RLock()
         self.mics: list[Mic] = []
         self.listening: int | None = None
@@ -167,14 +171,18 @@ class Monitor:
             except Exception:
                 pass
             self.mics = self.find_inputs()
-            self._open_output()
+            # Open the mics first: a Bluetooth headset switches into "call mode" when its mic
+            # opens, and macOS may then move the system output to it. Opening the output
+            # afterwards, on an explicitly chosen device, avoids playing into the wrong place.
             for mic in self.mics:
                 self._open_input(mic)
+            time.sleep(0.5)
+            self.outputs = self.list_outputs()
+            self._open_output(self.pick_output())
             if self.listening is not None and not any(m.index == self.listening for m in self.mics):
                 self.listening = None
             ok = [m for m in self.mics if m.error is None]
             self.message = "" if self.mics else "No mics found"
-            print(f"\nOutput (what you hear): {self.out_name}")
             print(f"Monitoring {len(ok)} of {len(self.mics)} mic(s):")
             for m in self.mics:
                 tag = "Bluetooth" if m.bluetooth else "other"
@@ -188,6 +196,34 @@ class Monitor:
                 except Exception:
                     pass
                 m.stream = None
+        self._close_output()
+
+    # ---- output (where the selected mic is played)
+    @staticmethod
+    def list_outputs() -> list[dict]:
+        return [{"id": i, "name": d["name"]} for i, d in enumerate(sd.query_devices())
+                if d["max_output_channels"] > 0]
+
+    def pick_output(self) -> int | None:
+        names = {o["id"]: o["name"].lower() for o in self.outputs}
+        if self.output_pref:
+            for i, n in names.items():
+                if self.output_pref.lower() in n:
+                    return i
+            print(f"No output matching '{self.output_pref}', using the laptop speakers.")
+        # Default: the laptop's own speakers, so the sound comes out loud on the Mac.
+        for i, n in names.items():
+            if "speaker" in n and ("macbook" in n or "built-in" in n or "imac" in n):
+                return i
+        for i, n in names.items():
+            if "speaker" in n:
+                return i
+        try:
+            return sd.default.device[1] if sd.default.device[1] >= 0 else None
+        except Exception:
+            return None
+
+    def _close_output(self):
         if self.out_stream is not None:
             try:
                 self.out_stream.stop(); self.out_stream.close()
@@ -195,20 +231,38 @@ class Monitor:
                 pass
             self.out_stream = None
 
-    def _open_output(self):
+    def _open_output(self, index: int | None):
+        self._close_output()
         try:
-            dev = sd.query_devices(kind="output")
+            dev = sd.query_devices(index) if index is not None else sd.query_devices(kind="output")
+            self.out_index = index
             self.out_rate = float(dev["default_samplerate"])
             self.out_name = dev["name"]
             ch = min(2, int(dev["max_output_channels"])) or 1
             self.out_stream = sd.OutputStream(
-                samplerate=self.out_rate, channels=ch, dtype="float32",
+                device=index, samplerate=self.out_rate, channels=ch, dtype="float32",
                 callback=self._out_cb, latency="low",
             )
             self.out_stream.start()
         except Exception as e:
             self.out_stream = None
-            self.out_name = f"unavailable ({e})"
+            self.out_name = f"unavailable ({str(e).splitlines()[0][:80]})"
+        print(f"Output (what you hear): {self.out_name}")
+
+    def set_output(self, index: int):
+        with self.lock:
+            self.output_pref = None
+            self._open_output(index)
+
+    def watchdog(self):
+        """Reopen the output if macOS kills it (it can when Bluetooth devices change mode)."""
+        while True:
+            time.sleep(1.0)
+            with self.lock:
+                s = self.out_stream
+                if s is not None and not s.active:
+                    print("Output stream stopped; reopening it.")
+                    self._open_output(self.out_index)
 
     def _open_input(self, mic: Mic):
         try:
@@ -230,7 +284,10 @@ class Monitor:
             if rms > ACTIVE_THRESHOLD:
                 mic.last_loud = time.monotonic()
             if self.listening == mic.index and self.out_stream is not None:
-                self._push(self._resample(x, mic.rate, self.out_rate))
+                y = self._resample(x, mic.rate, self.out_rate)
+                if self.gain != 1.0:
+                    y = np.clip(y * self.gain, -1.0, 1.0)
+                self._push(y)
         return cb
 
     @staticmethod
@@ -279,6 +336,8 @@ class Monitor:
             return {
                 "mics": [m.to_dict(self.listening) for m in self.mics],
                 "output": self.out_name,
+                "output_id": self.out_index,
+                "outputs": self.outputs,
                 "message": self.message,
             }
 
@@ -310,7 +369,8 @@ class DemoMonitor:
             m.level = rms if rms > m.level else m.level * 0.85 + rms * 0.15
             if rms > ACTIVE_THRESHOLD:
                 m.last_loud = t
-        return {"mics": [m.to_dict(self.listening) for m in self.mics], "output": "Demo output", "message": ""}
+        return {"mics": [m.to_dict(self.listening) for m in self.mics], "output": "Demo output",
+                "output_id": 0, "outputs": [{"id": 0, "name": "Demo output"}], "message": ""}
 
     def close(self):
         pass
@@ -361,6 +421,12 @@ def make_handler(monitor):
                 except ValueError:
                     return self._send(400, b"bad id", "text/plain")
                 self._send(200, b"ok", "text/plain")
+            elif self.path.startswith("/output/"):
+                try:
+                    monitor.set_output(int(self.path.rsplit("/", 1)[1]))
+                except (ValueError, AttributeError):
+                    return self._send(400, b"bad id", "text/plain")
+                self._send(200, b"ok", "text/plain")
             elif self.path == "/rescan":
                 monitor.scan()
                 self._send(200, b"ok", "text/plain")
@@ -377,6 +443,9 @@ def main():
     ap.add_argument("--demo", action="store_true", help="fake mics, no audio hardware needed")
     ap.add_argument("--bluetooth-only", action="store_true", help="hide every mic that isn't Bluetooth")
     ap.add_argument("--include-builtin", action="store_true", help="also show the MacBook's built-in mic")
+    ap.add_argument("--output", help="play through this output (part of its name), e.g. --output AirPods. "
+                                     "Default: the laptop speakers")
+    ap.add_argument("--gain", type=float, default=2.0, help="playback boost for quiet Bluetooth mics (default 2.0)")
     ap.add_argument("--no-browser", action="store_true", help="don't open the screen automatically")
     args = ap.parse_args()
 
@@ -389,9 +458,11 @@ def main():
             bt = connected_bluetooth_names()
             print("\nConnected Bluetooth devices:", ", ".join(bt) if bt else "(none detected)")
             return
-        monitor = Monitor(args.bluetooth_only, args.include_builtin)
+        monitor = Monitor(args.bluetooth_only, args.include_builtin, args.output, args.gain)
 
     monitor.scan()
+    if hasattr(monitor, "watchdog"):
+        threading.Thread(target=monitor.watchdog, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(monitor))
     server.daemon_threads = True
     url = f"http://localhost:{args.port}"
