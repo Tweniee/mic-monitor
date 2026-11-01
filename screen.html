@@ -19,6 +19,8 @@
   .pills { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 14px; }
   .pill { padding: 6px 12px; border-radius: 999px; font-size: 13px; border: 1px solid; }
   .pill.warn { background: rgba(255,207,92,.08); color: var(--warn); border-color: rgba(255,207,92,.25); }
+  .pill.out select { background: transparent; color: var(--listen); border: 0; font: inherit; cursor: pointer; outline: none; }
+  .pill.out select option { background: #111521; color: var(--text); }
   .pill.out { background: rgba(106,168,255,.08); color: var(--listen); border-color: rgba(106,168,255,.25); }
   #grid { width: 100%; max-width: 1240px; display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(190px, 230px)); justify-content: center; }
   .card {
@@ -65,7 +67,7 @@
     <div class="sub">Every connected mic, live. Click one to listen to just that mic.</div>
     <div class="pills">
       <span class="pill warn">🎧 Wear headphones to avoid feedback</span>
-      <span class="pill out" id="out">Output: …</span>
+      <label class="pill out">🔊 Play through <select id="out"></select></label>
     </div>
   </header>
   <main id="grid"></main>
@@ -105,7 +107,14 @@ function build(mics) {
 }
 
 function update(s) {
-  document.getElementById('out').textContent = 'Output: ' + s.output;
+  const sel = document.getElementById('out');
+  const okey = (s.outputs || []).map(o => o.id + o.name).join('|');
+  if (sel.dataset.key !== okey) {
+    sel.dataset.key = okey;
+    sel.innerHTML = '';
+    for (const o of s.outputs || []) sel.add(new Option(clean(o.name), o.id));
+  }
+  if (document.activeElement !== sel && s.output_id != null) sel.value = String(s.output_id);
   const key = s.mics.map(m => m.id + m.name + !!m.error).join('|');
   if (key !== layoutKey) { layoutKey = key; build(s.mics); }
   for (const m of s.mics) {
@@ -126,6 +135,7 @@ function connect() {
   es.onmessage = e => { foot.classList.remove('offline'); foot.textContent = 'Audio stays on this laptop. Nothing is recorded or saved.'; update(JSON.parse(e.data)); };
   es.onerror = () => { foot.classList.add('offline'); foot.textContent = 'Lost connection to mic_monitor.py. Is it still running?'; };
 }
+document.getElementById('out').onchange = e => fetch('/output/' + e.target.value, { method: 'POST' });
 document.getElementById('rescan').onclick = async e => {
   e.target.textContent = 'Scanning…';
   await fetch('/rescan', { method: 'POST' });

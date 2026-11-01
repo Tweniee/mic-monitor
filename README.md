@@ -23,6 +23,8 @@ If you missed it: System Settings > Privacy & Security > Microphone > turn on Te
 | `./run.sh --list` | Print every audio device Python sees and the connected Bluetooth devices |
 | `./run.sh --bluetooth-only` | Hide every mic that isn't Bluetooth |
 | `./run.sh --include-builtin` | Also show the MacBook's built-in mic (hidden by default) |
+| `./run.sh --output AirPods` | Play through a specific output instead of the laptop speakers (part of its name) |
+| `./run.sh --gain 3` | Make the selected mic louder (default 2) |
 | `./run.sh --demo` | Fake mics, for testing the screen or recording B-roll |
 
 Connected a new device while it's running? Press **Rescan devices**.
@@ -34,5 +36,9 @@ Connected a new device while it's running? Press **Rescan devices**.
 2. If it's listed but its card says "Could not open this mic", macOS likely can't run
    that many Bluetooth mics at once. Disconnect one and rescan.
 3. Cards show up but never light up: Terminal doesn't have microphone permission (see above).
+
+4. Mic lights up but you hear nothing: check the **Play through** picker at the top of the screen.
+   It defaults to the laptop speakers. When a Bluetooth mic turns on, macOS often moves the
+   system output to that headset, so sound can end up in the headset instead.
 
 Listen on headphones. Bluetooth mics switch to "call quality" audio while in use; that's normal.
