@@ -57,6 +57,7 @@
   .empty h2 { color: var(--text); margin: 0 0 8px; font-size: 22px; }
   button { margin-top: 26px; background: transparent; color: var(--muted); border: 1px solid #2a3247; font: inherit; font-size: 14px; padding: 8px 16px; border-radius: 10px; cursor: pointer; }
   button:hover { color: var(--text); border-color: #3a4560; }
+  .msg { max-width: 640px; margin: -8px auto 22px; text-align: center; color: var(--warn); font-size: 14px; background: rgba(255,207,92,.06); border: 1px solid rgba(255,207,92,.2); border-radius: 12px; padding: 10px 14px; }
   footer { margin-top: 18px; color: var(--dim); font-size: 13px; text-align: center; }
   .offline { color: var(--err); }
 </style>
@@ -70,6 +71,7 @@
       <label class="pill out">🔊 Play through <select id="out"></select></label>
     </div>
   </header>
+  <div id="msg" class="msg" hidden></div>
   <main id="grid"></main>
   <button id="rescan">Rescan devices</button>
   <footer id="foot">Audio stays on this laptop. Nothing is recorded or saved.</footer>
@@ -81,8 +83,13 @@ let layoutKey = '';
 
 function clean(n) { return n.replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)\s*$/i, ''); }
 
-function build(mics) {
+function build(mics, scanning) {
   grid.innerHTML = ''; cards.clear();
+  if (!mics.length && scanning) {
+    grid.style.display = 'block';
+    grid.innerHTML = '<div class="empty"><h2>Scanning devices…</h2><div>Opening each mic. Bluetooth mics can take a few seconds.</div></div>';
+    return;
+  }
   if (!mics.length) {
     grid.style.display = 'block';
     grid.innerHTML = `<div class="empty"><h2>No Bluetooth mics found</h2>
@@ -115,15 +122,20 @@ function update(s) {
     for (const o of s.outputs || []) sel.add(new Option(clean(o.name), o.id));
   }
   if (document.activeElement !== sel && s.output_id != null) sel.value = String(s.output_id);
-  const key = s.mics.map(m => m.id + m.name + !!m.error).join('|');
-  if (key !== layoutKey) { layoutKey = key; build(s.mics); }
+  const key = s.mics.map(m => m.id + m.name + !!m.error).join('|') + '#' + (!s.mics.length && s.scanning);
+  if (key !== layoutKey) { layoutKey = key; build(s.mics, s.scanning); }
+  const msg = document.getElementById('msg');
+  const text = s.message && s.message !== 'No mics found' ? s.message : '';
+  msg.hidden = !text; msg.textContent = text;
+  const rb = document.getElementById('rescan');
+  rb.disabled = !!s.scanning; rb.textContent = s.scanning ? 'Scanning…' : 'Rescan devices';
   for (const m of s.mics) {
     const el = cards.get(m.id); if (!el) continue;
     el.classList.toggle('active', m.active);
     el.classList.toggle('listening', m.listening);
     el.classList.toggle('broken', !!m.error);
     el.querySelector('.meter > i').style.width = Math.min(100, Math.sqrt(m.level) * 220) + '%';
-    el.querySelector('.state').textContent = m.error ? 'Could not open this mic'
+    el.querySelector('.state').textContent = m.error ? m.error
       : m.listening ? (m.active ? 'Listening · picking up sound' : 'Listening · quiet')
       : (m.active ? 'Picking up sound' : 'Silent');
   }
@@ -136,11 +148,7 @@ function connect() {
   es.onerror = () => { foot.classList.add('offline'); foot.textContent = 'Lost connection to mic_monitor.py. Is it still running?'; };
 }
 document.getElementById('out').onchange = e => fetch('/output/' + e.target.value, { method: 'POST' });
-document.getElementById('rescan').onclick = async e => {
-  e.target.textContent = 'Scanning…';
-  await fetch('/rescan', { method: 'POST' });
-  e.target.textContent = 'Rescan devices';
-};
+document.getElementById('rescan').onclick = () => fetch('/rescan', { method: 'POST' });
 connect();
 </script>
 </body>

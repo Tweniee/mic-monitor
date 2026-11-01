@@ -122,7 +122,34 @@ class Mic:
         }
 
 
+def call_with_timeout(fn, timeout: float, what: str):
+    """Run a PortAudio/Core Audio call on a helper thread so a stuck call can't freeze the app.
+
+    macOS can block forever when a Bluetooth device changes mode or refuses a second
+    headset mic. If that happens we give up on the call and report it instead of hanging.
+    """
+    box: dict = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 - re-raised on the caller's thread
+            box["error"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"macOS audio did not respond while {what} (waited {timeout:g}s)")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
 class Monitor:
+    OPEN_TIMEOUT = 4.0
+    CLOSE_TIMEOUT = 2.0
+
     def __init__(self, bluetooth_only: bool, include_builtin: bool, output: str | None, gain: float):
         self.bluetooth_only = bluetooth_only
         self.include_builtin = include_builtin
@@ -130,7 +157,9 @@ class Monitor:
         self.gain = gain
         self.out_index: int | None = None
         self.outputs: list[dict] = []
-        self.lock = threading.RLock()
+        # Only one scan / device change at a time. Nothing the screen calls waits on this,
+        # so the screen keeps updating even if macOS is slow to answer.
+        self.audio_lock = threading.Lock()
         self.mics: list[Mic] = []
         self.listening: int | None = None
         self.out_stream = None
@@ -140,6 +169,8 @@ class Monitor:
         self.buffered = 0
         self.buf_lock = threading.Lock()
         self.message = ""
+        self.scanning = False
+        self.last_out_retry = 0.0
 
     # ---- device discovery
     def find_inputs(self) -> list[Mic]:
@@ -161,41 +192,73 @@ class Monitor:
         return found[:MAX_MICS]
 
     # ---- (re)scan: stop everything, re-read the device list, reopen streams
+    def scan_async(self):
+        if self.scanning:
+            return
+        threading.Thread(target=self.scan, daemon=True).start()
+
     def scan(self):
-        with self.lock:
+        if not self.audio_lock.acquire(blocking=False):
+            return
+        self.scanning = True
+        self.message = "Scanning devices…"
+        try:
             self._stop_all()
             # PortAudio caches the device list; re-initialise it to see newly connected devices.
             try:
-                sd._terminate()
-                sd._initialize()
+                call_with_timeout(lambda: (sd._terminate(), sd._initialize()), 6, "re-reading the device list")
+            except TimeoutError as e:
+                self.mics = []
+                self.message = f"{e}. Quit (Ctrl+C) and start the app again."
+                print(self.message)
+                return
             except Exception:
                 pass
-            self.mics = self.find_inputs()
-            # Open the mics first: a Bluetooth headset switches into "call mode" when its mic
-            # opens, and macOS may then move the system output to it. Opening the output
-            # afterwards, on an explicitly chosen device, avoids playing into the wrong place.
-            for mic in self.mics:
+            mics = self.find_inputs()
+            # Open the mics one by one. A mic macOS refuses (or that hangs) gets an error on its
+            # card; the others keep working.
+            for mic in mics:
                 self._open_input(mic)
+                time.sleep(0.3)  # give Core Audio a moment between Bluetooth mode switches
+            self.mics = mics
+            if self.listening is not None and not any(m.index == self.listening and not m.error for m in mics):
+                self.listening = None
+            # Open the output last: opening a Bluetooth mic can move the system output to it.
             time.sleep(0.5)
             self.outputs = self.list_outputs()
             self._open_output(self.pick_output())
-            if self.listening is not None and not any(m.index == self.listening for m in self.mics):
-                self.listening = None
-            ok = [m for m in self.mics if m.error is None]
-            self.message = "" if self.mics else "No mics found"
-            print(f"Monitoring {len(ok)} of {len(self.mics)} mic(s):")
-            for m in self.mics:
+            ok = [m for m in mics if m.error is None]
+            bt_ok = [m for m in ok if m.bluetooth]
+            bt_bad = [m for m in mics if m.bluetooth and m.error]
+            if not mics:
+                self.message = "No mics found"
+            elif bt_bad and bt_ok:
+                self.message = ("macOS is only running some of the Bluetooth mics. "
+                                "Macs usually allow one Bluetooth headset mic at a time.")
+            else:
+                self.message = ""
+            print(f"Monitoring {len(ok)} of {len(mics)} mic(s):")
+            for m in mics:
                 tag = "Bluetooth" if m.bluetooth else "other"
                 print(f"  [{m.index}] {m.name} ({tag}, {int(m.rate)} Hz)" + (f"  ERROR: {m.error}" if m.error else ""))
+        finally:
+            self.scanning = False
+            self.audio_lock.release()
+
+    def _stop_stream(self, stream, what):
+        if stream is None:
+            return
+        try:
+            # abort() doesn't wait for buffers to drain, so it can't block on a dead device.
+            call_with_timeout(lambda: (stream.abort(), stream.close()), self.CLOSE_TIMEOUT, what)
+        except Exception as e:
+            print(f"Ignoring: {e}")
 
     def _stop_all(self):
-        for m in self.mics:
-            if m.stream is not None:
-                try:
-                    m.stream.stop(); m.stream.close()
-                except Exception:
-                    pass
-                m.stream = None
+        mics, self.mics = self.mics, []
+        for m in mics:
+            s, m.stream = m.stream, None
+            self._stop_stream(s, f"closing {m.name}")
         self._close_output()
 
     # ---- output (where the selected mic is played)
@@ -224,53 +287,73 @@ class Monitor:
             return None
 
     def _close_output(self):
-        if self.out_stream is not None:
-            try:
-                self.out_stream.stop(); self.out_stream.close()
-            except Exception:
-                pass
-            self.out_stream = None
+        s, self.out_stream = self.out_stream, None
+        self._stop_stream(s, "closing the output")
 
     def _open_output(self, index: int | None):
         self._close_output()
         try:
             dev = sd.query_devices(index) if index is not None else sd.query_devices(kind="output")
             self.out_index = index
-            self.out_rate = float(dev["default_samplerate"])
-            self.out_name = dev["name"]
+            rate = float(dev["default_samplerate"])
             ch = min(2, int(dev["max_output_channels"])) or 1
-            self.out_stream = sd.OutputStream(
-                device=index, samplerate=self.out_rate, channels=ch, dtype="float32",
-                callback=self._out_cb, latency="low",
-            )
-            self.out_stream.start()
+
+            def make():
+                s = sd.OutputStream(device=index, samplerate=rate, channels=ch, dtype="float32",
+                                    callback=self._out_cb, latency="low")
+                s.start()
+                return s
+
+            self.out_rate = rate
+            self.out_stream = call_with_timeout(make, self.OPEN_TIMEOUT, f"opening {dev['name']}")
+            self.out_name = dev["name"]
         except Exception as e:
             self.out_stream = None
             self.out_name = f"unavailable ({str(e).splitlines()[0][:80]})"
         print(f"Output (what you hear): {self.out_name}")
 
     def set_output(self, index: int):
-        with self.lock:
-            self.output_pref = None
-            self._open_output(index)
+        def run():
+            with self.audio_lock:
+                self.output_pref = None
+                self._open_output(index)
+        threading.Thread(target=run, daemon=True).start()
 
     def watchdog(self):
-        """Reopen the output if macOS kills it (it can when Bluetooth devices change mode)."""
+        """Notice streams macOS killed (it can when Bluetooth devices change mode)."""
         while True:
             time.sleep(1.0)
-            with self.lock:
+            if not self.audio_lock.acquire(blocking=False):
+                continue  # a scan or output change is running
+            try:
+                for m in self.mics:
+                    if m.stream is not None and m.error is None and not m.stream.active:
+                        m.error = "macOS stopped this mic"
+                        print(f"{m.name}: {m.error}")
+                        if self.listening == m.index:
+                            self.listening = None
                 s = self.out_stream
-                if s is not None and not s.active:
+                now = time.monotonic()
+                if (s is None or not s.active) and now - self.last_out_retry > 3:
+                    self.last_out_retry = now
                     print("Output stream stopped; reopening it.")
                     self._open_output(self.out_index)
+            except Exception as e:
+                print(f"Watchdog: {e}")
+            finally:
+                self.audio_lock.release()
 
     def _open_input(self, mic: Mic):
+        def make():
+            s = sd.InputStream(device=mic.index, channels=min(mic.channels, 2), samplerate=mic.rate,
+                               dtype="float32", callback=self._make_in_cb(mic), latency="low")
+            s.start()
+            return s
         try:
-            mic.stream = sd.InputStream(
-                device=mic.index, channels=min(mic.channels, 2), samplerate=mic.rate,
-                dtype="float32", callback=self._make_in_cb(mic), latency="low",
-            )
-            mic.stream.start()
+            mic.stream = call_with_timeout(make, self.OPEN_TIMEOUT, f"opening {mic.name}")
+        except TimeoutError:
+            mic.stream = None
+            mic.error = "macOS didn't start this mic (likely the one-Bluetooth-mic limit)"
         except Exception as e:
             mic.stream = None
             mic.error = str(e).split("\n")[0][:120]
@@ -323,27 +406,32 @@ class Monitor:
 
     # ---- controls
     def toggle(self, mic_id: int):
-        with self.lock:
-            self.listening = None if self.listening == mic_id else mic_id
-            with self.buf_lock:
-                self.chunks.clear()
-                self.buffered = 0
-            name = next((m.name for m in self.mics if m.index == self.listening), None)
-            print(f"Listening to: {name}" if name else "Listening stopped")
+        mic = next((m for m in self.mics if m.index == mic_id), None)
+        if mic is None or mic.error:
+            return
+        self.listening = None if self.listening == mic_id else mic_id
+        with self.buf_lock:
+            self.chunks.clear()
+            self.buffered = 0
+        print(f"Listening to: {mic.name}" if self.listening is not None else "Listening stopped")
 
     def state(self) -> dict:
-        with self.lock:
-            return {
-                "mics": [m.to_dict(self.listening) for m in self.mics],
-                "output": self.out_name,
-                "output_id": self.out_index,
-                "outputs": self.outputs,
-                "message": self.message,
-            }
+        # No locks here: the screen must keep updating even while macOS is busy.
+        mics = list(self.mics)
+        return {
+            "mics": [m.to_dict(self.listening) for m in mics],
+            "output": self.out_name,
+            "output_id": self.out_index,
+            "outputs": list(self.outputs),
+            "message": self.message,
+            "scanning": self.scanning,
+        }
 
     def close(self):
-        with self.lock:
-            self._stop_all()
+        try:
+            call_with_timeout(self._stop_all, 4, "shutting down")
+        except Exception:
+            pass
 
 
 class DemoMonitor:
@@ -428,7 +516,7 @@ def make_handler(monitor):
                     return self._send(400, b"bad id", "text/plain")
                 self._send(200, b"ok", "text/plain")
             elif self.path == "/rescan":
-                monitor.scan()
+                getattr(monitor, "scan_async", monitor.scan)()
                 self._send(200, b"ok", "text/plain")
             else:
                 self._send(404, b"not found", "text/plain")
